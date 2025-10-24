@@ -1,155 +1,237 @@
 #!/usr/bin/env python3
-import os, sys, json, time, argparse, traceback
+# reaper_portal_open.py
+# Ein-Pfad-Helper: xdg-desktop-portal via Gio/DBus (keine GTK-Abhängigkeit)
+# - JSON auf stdout (--out -)
+# - robuste choices-Auswertung (Map ODER Liste)
+# - korrekte Filter inkl. Start-Filter (a(sa(us)) / (sa(us)))
+# - Auto-Parenting unter X11 (PPID -> XID via xprop), optional --parent
+# - Flatpak-/Portal-kompatibel
 
-def write_json_atomic(path, obj):
+import os, sys, json, time, argparse, shutil, subprocess, traceback
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+# ---------------- I/O ----------------
+def write_json(obj, out_target):
     data = json.dumps(obj)
-    if path == "-":  # direkt auf stdout
-        sys.stdout.write(data)
-        sys.stdout.flush()
-        return
-    tmp = f"{path}.tmp-{int(time.time()*1e6)}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    if out_target == "-":
+        sys.stdout.write(data); sys.stdout.flush()
+    else:
+        tmp = f"{out_target}.tmp-{int(time.time()*1e6)}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, out_target)
 
+def log_err(msg, err_target):
+    if not err_target: return
+    line = msg if msg.endswith("\n") else msg + "\n"
+    if err_target == "-":
+        try: sys.stderr.write(line); sys.stderr.flush()
+        except Exception: pass
+    else:
+        try:
+            with open(err_target, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception: pass
+
+def which(cmd): return shutil.which(cmd) is not None
+
+# ---------------- Parenting (X11) ----------------
+def detect_x11_parent_from_ppid():
+    # Best effort: per xprop die Fenster-XID des Elternprozesses (REAPER) finden
+    if (os.getenv("XDG_SESSION_TYPE") or "").lower() == "wayland":
+        return None
+    if not which("xprop"):
+        return None
+    ppid = os.getppid()
+    try:
+        root = subprocess.check_output(
+            ["xprop", "-root", "_NET_CLIENT_LIST"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        ids = []
+        for token in root.replace("\n", " ").split(","):
+            token = token.strip()
+            if not token: continue
+            wid = token.split()[-1]
+            if wid.startswith("0x"): ids.append(wid)
+        for wid in ids:
+            try:
+                pid_out = subprocess.check_output(
+                    ["xprop", "-id", wid, "_NET_WM_PID"],
+                    text=True, stderr=subprocess.DEVNULL
+                )
+                pid = int(pid_out.split("=")[-1].strip())
+                if pid == ppid:
+                    return "x11:" + wid
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+# ---------------- Portal (Gio/DBus) ----------------
+def make_choices_variant():
+    # a(ssa(ss)s): (id, label, options[], default)
+    return GLib.Variant('a(ssa(ss)s)', [
+        ('open_in_new_tab', 'Open in new project tab', [], 'false'),
+        ('fx_offline',      'Open with FX offline (recovery mode)', [], 'false'),
+    ])
+
+def make_filters_and_current():
+    """
+    filters : a(sa(us))
+      - Element: (label: s, entries: a(us))
+      - entry: (u, s) mit u = FileFilterType (0=glob, 1=mime)
+    Rückgabe:
+      filters_variant: GLib.Variant('a(sa(us))', ...)
+      current_filter_tuple: ('All Supported Projects', a(us)-Einträge als Python-Liste)
+    """
+    GLOB = 0
+    def E(pat):  # eine entry (glob, pattern)
+        return (GLOB, pat)
+
+    # WICHTIG: *kein* "*.*" in All Supported
+    all_supported_globs = ["*.RPP","*.TXT","*.EDL","PROJ*.TXT","*.ADL","clipsort.log","*.RPP-BAK"]
+
+    filters_py = [
+        ('All Supported Projects',                  [E(p) for p in all_supported_globs]),
+        ('REAPER Project files (*.RPP)',            [E("*.RPP")]),
+        ('EDL TXT (Vegas) files (*.TXT)',           [E("*.TXT")]),
+        ('EDL (Samplitude) files (*.EDL)',          [E("*.EDL")]),
+        ('RADAR Session TXT files (PROJ*.TXT)',     [E("PROJ*.TXT")]),
+        ('AES-31 files (*.ADL)',                    [E("*.ADL")]),
+        ('NINJAM log files (clipsort.log)',         [E("clipsort.log")]),
+        ('REAPER Project Backup files (*.RPP-BAK)', [E("*.RPP-BAK")]),
+        ('All files (*.*)',                         [E("*.*")]),
+    ]
+
+    filters_variant = GLib.Variant('a(sa(us))', filters_py)
+    current_filter_tuple = ('All Supported Projects', [E(p) for p in all_supported_globs])
+    return filters_variant, current_filter_tuple
+
+def normalize_choices(ch):
+    """
+    Portal kann 'choices' als a{ss} (Map) ODER a(ss) (Liste) liefern.
+    Wir normalisieren auf dict[str,bool].
+    """
+    if isinstance(ch, dict):
+        return {k: (v == 'true') for k, v in ch.items()}
+    if isinstance(ch, (list, tuple)):
+        out = {}
+        for item in ch:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                k, v = item[0], item[1]
+                if isinstance(k, str) and isinstance(v, str):
+                    out[k] = (v == 'true')
+        return out
+    return {}
+
+def open_file_via_portal(parent, title, timeout_s):
+    """
+    org.freedesktop.portal.FileChooser.OpenFile(parent, title, options)
+    Signatur: (s s a{sv}) -> (o)
+    Rückgabe: (path:str|None, choices:dict)
+    """
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    proxy = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+        'org.freedesktop.portal.Desktop',
+        '/org/freedesktop/portal/desktop',
+        'org.freedesktop.portal.FileChooser',
+        None
+    )
+
+    filters_variant, current_filter_tuple = make_filters_and_current()
+
+    # a{sv} als Python-Dict (Werte jeweils GLib.Variant)
+    opts = {
+        'multiple':       GLib.Variant('b', False),
+        'choices':        make_choices_variant(),
+        'filters':        filters_variant,                                # a(sa(us))
+        'current_filter': GLib.Variant('(sa(us))', current_filter_tuple), # (sa(us))  <-- wichtig
+        'modal':          GLib.Variant('b', True),
+    }
+
+    params = GLib.Variant('(ssa{sv})', (parent or '', title, opts))
+    res = proxy.call_sync('OpenFile', params, 0, -1, None)
+    request_path = res.unpack()[0]
+
+    req = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+        'org.freedesktop.portal.Desktop',
+        request_path,
+        'org.freedesktop.portal.Request',
+        None
+    )
+
+    result = {'path': None, 'choices': {}, 'done': False}
+    loop = GLib.MainLoop()
+
+    def on_signal(proxy, sender, signal_name, params):
+        if signal_name != 'Response':
+            return
+        try:
+            code, a = params.unpack()  # (u, a{sv})
+            if code == 0:
+                uris = a.get('uris', [])
+                ch   = a.get('choices', {})
+                if uris:
+                    uri = uris[0]
+                    if uri.startswith("file://"):
+                        from urllib.parse import unquote
+                        result['path'] = unquote(uri[7:])
+                    else:
+                        result['path'] = uri
+                result['choices'] = normalize_choices(ch)
+            result['done'] = True
+        finally:
+            loop.quit()
+
+    req.connect('g-signal', on_signal)
+
+    if timeout_s and timeout_s > 0:
+        def on_timeout():
+            if not result['done']:
+                result['done'] = True
+                loop.quit()
+            return False
+        GLib.timeout_add_seconds(timeout_s, on_timeout)
+
+    loop.run()
+    return result['path'], result['choices']
+
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True, help="Pfad zur JSON-Ausgabe oder '-' für stdout")
-    ap.add_argument("--err", default=None, help="Pfad für Fehler-Log (Text) oder '-' für stderr")
-    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--out",     required=True, help="'-' für stdout")
+    ap.add_argument("--err",     default="-",  help="'-' für stderr'")
+    ap.add_argument("--parent",  default=None, help="x11:0x… oder wayland:HANDLE (optional)")
+    ap.add_argument("--timeout", type=int, default=120, help="Timeout in Sekunden (0=kein Timeout)")
     args = ap.parse_args()
 
-    def log_err(msg):
-        if not args.err:
-            return
-        if args.err == "-":
-            try:
-                sys.stderr.write(msg + "\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
-            return
-        try:
-            with open(args.err, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-        except Exception:
-            pass
-
-    if args.selftest:
-        write_json_atomic(args.out, {"selftest": True, "ok": True})
-        return 0
-
-    os.environ.setdefault("GTK_USE_PORTAL", "1")
-
     try:
-        import gi
-    except Exception as e:
-        write_json_atomic(args.out, {"error": f"python3-gi not available: {e}"})
-        return 1
+        parent = args.parent or detect_x11_parent_from_ppid()
+        title  = "Open project (Portal)"
+        path, choices = open_file_via_portal(parent, title, args.timeout)
 
-    GTK4 = False
-    try:
-        gi.require_version("Gtk", "4.0")
-        from gi.repository import Gtk, GLib, Gdk
-        GTK4 = True
+        if path:
+            write_json({
+                "path": path,
+                "choices": {
+                    "open_in_new_tab": bool(choices.get("open_in_new_tab")),
+                    "fx_offline":      bool(choices.get("fx_offline")),
+                }
+            }, args.out)
+            return 0
+        else:
+            write_json({"path": None, "choices": {}}, args.out)
+            return 0
+
     except Exception:
-        try:
-            gi.require_version("Gtk", "3.0")
-            from gi.repository import Gtk, GLib, Gdk
-            GTK4 = False
-        except Exception as e:
-            write_json_atomic(args.out, {"error": f"GTK not available: {e}"})
-            return 1
-
-    try:
-        if Gdk.Display.get_default() is None:
-            write_json_atomic(args.out, {"error": "No display (Gdk.Display.get_default() is None)"})
-            return 1
-    except Exception as e:
-        write_json_atomic(args.out, {"error": f"Display init failed: {e}"})
-        return 1
-
-    try:
-        title = "Open project (Portal)"
-        dlg = Gtk.FileChooserNative.new(title, None, Gtk.FileChooserAction.OPEN, "_Open", "_Cancel")
-
-        # Filter
-        all_supported = ["*.RPP","*.TXT","*.EDL","PROJ*.TXT","*.ADL","clipsort.log","*.RPP-BAK"]
-        ff_all = Gtk.FileFilter(); ff_all.set_name("All Supported Projects")
-        for pat in all_supported: ff_all.add_pattern(pat)
-        (dlg.set_filter if GTK4 else dlg.add_filter)(ff_all)
-
-        for name, pats in [
-            ("REAPER Project files (*.RPP)", ["*.RPP"]),
-            ("EDL TXT (Vegas) files (*.TXT)", ["*.TXT"]),
-            ("EDL (Samplitude) files (*.EDL)", ["*.EDL"]),
-            ("RADAR Session TXT files (PROJ*.TXT)", ["PROJ*.TXT"]),
-            ("AES-31 files (*.ADL)", ["*.ADL"]),
-            ("NINJAM log files (clipsort.log)", ["clipsort.log"]),
-            ("REAPER Project Backup files (*.RPP-BAK)", ["*.RPP-BAK"]),
-            ("All files (*.*)", ["*.*"]),
-        ]:
-            f = Gtk.FileFilter(); f.set_name(name)
-            for p in pats: f.add_pattern(p)
-            dlg.add_filter(f)
-
-        # Choices (Checkboxen)
-        try:
-            if GTK4:
-                Gtk.FileChooser.add_choice(dlg, "open_in_new_tab", "Open in new project tab", None, None)
-                Gtk.FileChooser.set_choice(dlg, "open_in_new_tab", "false")
-                Gtk.FileChooser.add_choice(dlg, "fx_offline", "Open with FX offline (recovery mode)", None, None)
-                Gtk.FileChooser.set_choice(dlg, "fx_offline", "false")
-            else:
-                dlg.add_choice("open_in_new_tab", "Open in new project tab", None, None)
-                dlg.set_choice("open_in_new_tab", "false")
-                dlg.add_choice("fx_offline", "Open with FX offline (recovery mode)", None, None)
-                dlg.set_choice("fx_offline", "false")
-        except Exception as e:
-            log_err(f"choices unsupported: {e}")
-
-        loop = GLib.MainLoop()
-        result = {"path": None, "choices": {"open_in_new_tab": False, "fx_offline": False}}
-
-        def get_choice(key):
-            try:
-                if GTK4:
-                    return (Gtk.FileChooser.get_choice(dlg, key) == "true")
-                else:
-                    return (dlg.get_choice(key) == "true")
-            except Exception:
-                return False
-
-        def on_resp(native, response):
-            try:
-                if response == Gtk.ResponseType.ACCEPT:
-                    if GTK4:
-                        f = native.get_file()
-                        path = f.get_path() if f else None
-                    else:
-                        path = native.get_filename()
-                    result["path"] = path
-                    result["choices"]["open_in_new_tab"] = get_choice("open_in_new_tab")
-                    result["choices"]["fx_offline"] = get_choice("fx_offline")
-            finally:
-                try:
-                    native.destroy()
-                finally:
-                    loop.quit()
-
-        dlg.connect("response", on_resp)
-        dlg.show()
-        loop.run()
-
-        write_json_atomic(args.out, result)
-        return 0
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        log_err(tb)
-        write_json_atomic(args.out, {"error": repr(e)})
+        log_err("portal error:\n" + traceback.format_exc(), args.err)
+        write_json({"error": "portal call failed"}, args.out)
         return 1
 
 if __name__ == "__main__":
