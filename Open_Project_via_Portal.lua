@@ -1,62 +1,38 @@
--- @description Open Project via native portal (Lua -> Python writes JSON file) (portable + cancel-friendly)
--- @version 0.3.0
+-- @description Open Project via native portal (stdout, no /tmp, no console spam)
+-- @version 0.4.0
 
 local reaper = reaper
 
--- ---------- Pfad-Ermittlung: Helper neben diesem Lua-Skript (portabel), mit Fallback ----------
+-- ---------- portabler Helper-Pfad ----------
 local function script_dir()
-  local _, thisfn, _, _, _, _ = reaper.get_action_context()
+  local _, thisfn = reaper.get_action_context()
   return thisfn:match("^(.*)[/\\]") or "."
 end
-
-local function file_exists(p)
-  local f = io.open(p, "r"); if f then f:close(); return true end; return false
-end
-
 local function join(a,b)
-  if a:sub(-1) == "/" or a:sub(-1) == "\\" then return a..b end
   local sep = package.config:sub(1,1)
+  if a:sub(-1) == "/" or a:sub(-1) == "\\" then return a..b end
   return a..sep..b
 end
+local function file_exists(p) local f=io.open(p,"r"); if f then f:close(); return true end end
 
 local SCRIPT_DIR = script_dir()
-local HELPER_REL = "reaper_portal_open.py"              -- liegt idealerweise neben diesem Lua
-local HELPER = join(SCRIPT_DIR, HELPER_REL)
-
+local HELPER = join(SCRIPT_DIR, "reaper_portal_open.py")
 if not file_exists(HELPER) then
-  -- Fallback: im REAPER-ResourcePath /Scripts/<Projektordner>/...
   local res = reaper.GetResourcePath()
-  local candidates = {
-    join(res, join("Scripts","ReaperPortalFileChooser/"..HELPER_REL)),
-    join(res, HELPER_REL),
+  local cand = {
+    join(res, "Scripts/ReaperPortalFileChooser/reaper_portal_open.py"),
+    join(res, "Scripts/reaper_portal_open.py")
   }
-  for _,p in ipairs(candidates) do
-    if file_exists(p) then HELPER = p; break end
-  end
+  for _,p in ipairs(cand) do if file_exists(p) then HELPER=p; break end end
 end
 
--- Python (ggf. anpassen, falls anders installiert)
+-- Python-Binary (du hast gesagt 'python3' klappt bei dir)
 local PY = "python3"
 
--- ---------- Utils ----------
-local function tmpfile(ext)
-  local p = os.tmpname():gsub("\\","/")
-  if ext then p = p .. ext end
-  return p
-end
-
-local function readfile(p)
-  local f = io.open(p, "r"); if not f then return nil end
-  local s = f:read("*a"); f:close(); return s
-end
-
--- Minimaler JSON-Parser für unser Format
+-- ---------- kleines JSON-Parsing für unser Format ----------
 local function json_unescape(s)
-  s = s:gsub('\\"','"'):gsub("\\\\","\\")
-  s = s:gsub("\\n","\n"):gsub("\\t","\t"):gsub("\\r","\r")
-  return s
+  return (s:gsub('\\"','"'):gsub("\\\\","\\"):gsub("\\n","\n"):gsub("\\t","\t"):gsub("\\r","\r"))
 end
-
 local function parse_portal_json(txt)
   if not txt or txt == "" then return nil end
   local err = txt:match('"error"%s*:%s*"(.-)"'); if err then err = json_unescape(err) end
@@ -66,70 +42,48 @@ local function parse_portal_json(txt)
   return { error = err, path = path, choices = { open_in_new_tab = newtab, fx_offline = fxoff } }
 end
 
--- ---------- Hauptlogik ----------
+-- ---------- stdout lesen (ohne ExecProcess) ----------
+local function run_and_read_stdout(cmd)
+  local p = io.popen(cmd, "r")  -- blockiert bis Prozess beendet
+  if not p then return nil, "popen failed" end
+  local out = p:read("*a") or ""
+  local ok, reason, code = p:close()  -- ok==true bei exit 0
+  return out, (ok and nil or (reason..":"..tostring(code)))
+end
+
+local function quote(s) return string.format("%q", s) end
+
 local function main()
-  -- Helper da?
   if not file_exists(HELPER) then
-    reaper.ShowConsoleMsg(("Portal-Helper nicht gefunden.\nErwartet: %s\n"):format(HELPER))
+    -- NICHT in die Konsole schreiben, um das Fenster nicht zu öffnen:
+    reaper.MB("Portal-Helper nicht gefunden:\n"..tostring(HELPER), "ReaScript", 0)
     return
   end
 
-  local out_path = tmpfile(".reaper_portal.json")
-  local err_path = tmpfile(".reaper_portal.err")
-  os.remove(out_path); os.remove(err_path)
+  -- Python: schreibe JSON auf stdout, Fehler auf stderr
+  -- Wichtig: 2>&1 damit wir im Fehlerfall die Meldung im selben Stream sehen
+  local cmd = string.format('%s -u %s --out - --err - 2>&1', quote(PY), quote(HELPER))
+  local stdout, err = run_and_read_stdout(cmd)
 
-  -- Python starten – Helper schreibt direkt nach --out/--err
-  local cmd = string.format('"%s" -u "%s" --out "%s" --err "%s"', PY, HELPER, out_path, err_path)
-  local ret, _ = reaper.ExecProcess(cmd, 120000)  -- bis zu 120 s warten
-
-  -- Datei einlesen (kann beim echten Abbrechen fehlen)
-  local json_text = readfile(out_path)
-  local err_text  = readfile(err_path) or ""
-
-  -- FALL 1: Keine JSON-Datei + kein Fehlertext ⇒ als "Abgebrochen" behandeln, freundlich & still
-  if (not json_text or json_text == "") and (err_text == "" or err_text == nil) then
-    -- Optional: leise return; oder kleine Statuszeile:
-    -- reaper.ShowConsoleMsg("Abgebrochen.\n")
-    return
-  end
-
-  -- FALL 2: Keine JSON-Datei, aber Fehlertext vorhanden ⇒ echter Fehler
-  if not json_text or json_text == "" then
-    reaper.ShowConsoleMsg(
-      ("Portal-Helper: keine Ausgabe-Datei.\nExit=%s\nCMD: %s\nERR:\n%s\n")
-        :format(tostring(ret), cmd, err_text)
-    )
-    return
-  end
-
-  local obj = parse_portal_json(json_text)
+  -- Abbrechen: Der Helper liefert dann JSON mit "path": null – das behandeln wir leise
+  local obj = parse_portal_json(stdout or "")
   if not obj then
-    reaper.ShowConsoleMsg(
-      ("Portal-Helper: JSON konnte nicht gelesen werden.\nExit=%s\nCMD: %s\nJSON:\n%s\nERR:\n%s\n")
-        :format(tostring(ret), cmd, json_text, err_text)
-    )
+    -- Falls der Helper aus irgendeinem Grund nichts Sinnvolles zurückgab:
+    -- komplett still bleiben? -> ja, außer du willst Debug:
+    -- reaper.MB("Portal-Helper: keine gültige Antwort.", "ReaScript", 0)
     return
   end
-
   if obj.error then
-    -- Falls der Helper im Fehlerfall JSON mit "error" geschrieben hat
-    reaper.ShowConsoleMsg(("Portal-Helper-Fehler: %s\n"):format(tostring(obj.error)))
+    -- echte Fehler optional anzeigen
+    reaper.MB("Portal-Fehler:\n"..tostring(obj.error), "ReaScript", 0)
     return
   end
-
-  -- Normalfall
   if not obj.path or obj.path == "" then
-    -- JSON vorhanden, aber ohne Pfad ⇒ Abgebrochen im Dialog
-    -- (leise)
+    -- Dialog abgebrochen -> komplett still
     return
   end
 
-  reaper.ShowConsoleMsg(
-    string.format("Ausgewählt: %s\nopen_in_new_tab=%s, fx_offline=%s\n",
-      obj.path, tostring(obj.choices.open_in_new_tab), tostring(obj.choices.fx_offline))
-  )
-
-  -- Projekt öffnen
+  -- Erfolgsfall: direkt öffnen (ohne irgendeinen Console-Output)
   reaper.Main_openProject(obj.path)
 end
 

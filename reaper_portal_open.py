@@ -3,6 +3,10 @@ import os, sys, json, time, argparse, traceback
 
 def write_json_atomic(path, obj):
     data = json.dumps(obj)
+    if path == "-":  # direkt auf stdout
+        sys.stdout.write(data)
+        sys.stdout.flush()
+        return
     tmp = f"{path}.tmp-{int(time.time()*1e6)}"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(data)
@@ -12,13 +16,20 @@ def write_json_atomic(path, obj):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True, help="Pfad zur JSON-Ausgabedatei")
-    ap.add_argument("--err", required=False, help="Pfad für Fehler-Log (Text)")
+    ap.add_argument("--out", required=True, help="Pfad zur JSON-Ausgabe oder '-' für stdout")
+    ap.add_argument("--err", default=None, help="Pfad für Fehler-Log (Text) oder '-' für stderr")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     def log_err(msg):
         if not args.err:
+            return
+        if args.err == "-":
+            try:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
             return
         try:
             with open(args.err, "a", encoding="utf-8") as f:
@@ -38,7 +49,6 @@ def main():
         write_json_atomic(args.out, {"error": f"python3-gi not available: {e}"})
         return 1
 
-    # GTK4 bevorzugen, sonst GTK3
     GTK4 = False
     try:
         gi.require_version("Gtk", "4.0")
@@ -71,7 +81,7 @@ def main():
         for pat in all_supported: ff_all.add_pattern(pat)
         (dlg.set_filter if GTK4 else dlg.add_filter)(ff_all)
 
-        filters = [
+        for name, pats in [
             ("REAPER Project files (*.RPP)", ["*.RPP"]),
             ("EDL TXT (Vegas) files (*.TXT)", ["*.TXT"]),
             ("EDL (Samplitude) files (*.EDL)", ["*.EDL"]),
@@ -80,8 +90,7 @@ def main():
             ("NINJAM log files (clipsort.log)", ["clipsort.log"]),
             ("REAPER Project Backup files (*.RPP-BAK)", ["*.RPP-BAK"]),
             ("All files (*.*)", ["*.*"]),
-        ]
-        for name, pats in filters:
+        ]:
             f = Gtk.FileFilter(); f.set_name(name)
             for p in pats: f.add_pattern(p)
             dlg.add_filter(f)
@@ -99,7 +108,7 @@ def main():
                 dlg.add_choice("fx_offline", "Open with FX offline (recovery mode)", None, None)
                 dlg.set_choice("fx_offline", "false")
         except Exception as e:
-            log_err(f"choices not supported by backend: {e}")
+            log_err(f"choices unsupported: {e}")
 
         loop = GLib.MainLoop()
         result = {"path": None, "choices": {"open_in_new_tab": False, "fx_offline": False}}
@@ -139,12 +148,7 @@ def main():
 
     except Exception as e:
         tb = traceback.format_exc()
-        if args.err:
-            try:
-                with open(args.err, "a", encoding="utf-8") as f:
-                    f.write(tb + "\n")
-            except Exception:
-                pass
+        log_err(tb)
         write_json_atomic(args.out, {"error": repr(e)})
         return 1
 
