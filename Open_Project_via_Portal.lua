@@ -1,18 +1,22 @@
--- @description Open Project via xdg-desktop-portal (argument-driven helper)
--- @version 1.0.0
+-- @description Open Project via xdg-desktop-portal (per-action last-dir + last-choices)
+-- @version 1.3.1
 -- @about
 --   Öffnet den nativen File-Chooser (GNOME/KDE) via Portal.
 --   - Keine Ausgabe in die REAPER-Konsole
---   - Merkt den letzten Ordner (ExtState)
---   - Liest Optionen/Checkboxen aus der JSON-Ausgabe des Python-Helpers
---   Voraussetzung: reaper_portal_fc.py liegt neben diesem Skript oder in REAPER/Scripts.
+--   - Merkt den letzten Ordner und die zuletzt verwendeten Optionen (pro Aktion)
+--   - Speichert beides in REAPER/Data/PortalFileChooser/<Action>.state
+--   - Nutzt die Optionen aus dem Python-Helper (choices)
+--   - Implementiert: "Open in new project tab" und "Open with FX offline (recovery mode)"
+--   - NEU: Bei Abbruch werden Choices NICHT gespeichert/verändert.
 
 local reaper = reaper
 
 -- ---------- kleine Utils ----------
-local function script_dir()
+local function script_dir_and_name()
   local _, p = reaper.get_action_context()
-  return p:match("^(.*)[/\\]") or "."
+  local dir  = p:match("^(.*)[/\\]") or "."
+  local name = p:match("([^/\\]+)$") or "Open_Project_via_Portal.lua"
+  return dir, name
 end
 
 local function join(a, b)
@@ -26,6 +30,25 @@ local function exists(p)
   return false
 end
 
+local function read_text(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local s = f:read("*a") or ""
+  f:close()
+  s = s:gsub("[%s\r\n]+$", "")
+  if s == "" then return nil end
+  return s
+end
+
+local function write_text(path, content)
+  local f = io.open(path, "w")
+  if not f then return false end
+  f:write(content or "")
+  f:write("\n")
+  f:close()
+  return true
+end
+
 local function q(s) return string.format("%q", s) end
 
 local function run_capture_stdout(cmd)
@@ -36,9 +59,72 @@ local function run_capture_stdout(cmd)
   return out
 end
 
+-- ---------- winzige "INI" State-Datei (key=value) ----------
+local function load_state(path)
+  local s = {}
+  local f = io.open(path, "r")
+  if not f then return s end
+  local content = f:read("*a") or ""
+  f:close()
+
+  -- Legacy: alte .lastdir (nur Pfad)
+  if not content:find("=") then
+    local dir = content:gsub("[%s\r\n]+$", "")
+    if dir ~= "" then s.dir = dir end
+    return s
+  end
+
+  for line in content:gmatch("[^\r\n]+") do
+    local k, v = line:match("^%s*([^=%s]+)%s*=%s*(.-)%s*$")
+    if k then s[k] = v end
+  end
+  return s
+end
+
+local function save_state(path, state)
+  local f = io.open(path, "w")
+  if not f then return false end
+  if state.dir then f:write("dir=", state.dir, "\n") end
+  f:write("open_in_new_tab=", (state.open_in_new_tab and "1" or "0"), "\n")
+  f:write("fx_offline=",      (state.fx_offline      and "1" or "0"), "\n")
+  f:close()
+  return true
+end
+
+local function truthy01(x)
+  if type(x) == "boolean" then return x end
+  if type(x) ~= "string" then return false end
+  x = x:lower()
+  return (x == "1" or x == "true" or x == "yes" or x == "y" or x == "on")
+end
+
+-- ---------- JSON-Miniparser ----------
+local function json_get_string(s, key)
+  local pat = '"'..key..'":%s*"(.-)"'
+  local v = s:match(pat)
+  if v then v = v:gsub('\\"','"'):gsub("\\\\","\\") end
+  return v
+end
+
+local function json_has_null(s, key)
+  local pat = '"'..key..'":%s*null'
+  return s:match(pat) ~= nil
+end
+
+local function json_get_choice_bool(s, choice_key)
+  local block = s:match([["choices"%s*:%s*{(.-)}]])
+  if not block then return false end
+  local pat_true  = '"'..choice_key..'":%s*true'
+  local pat_false = '"'..choice_key..'":%s*false'
+  if block:match(pat_true) then return true end
+  if block:match(pat_false) then return false end
+  return false
+end
+
 -- ---------- Python-Helper finden ----------
 local PY = "python3"
-local HELPER = join(script_dir(), "reaper_portal_fc.py")
+local SCRIPT_DIR, SCRIPT_NAME = script_dir_and_name()
+local HELPER = join(SCRIPT_DIR, "reaper_portal_fc.py")
 if not exists(HELPER) then
   local res = reaper.GetResourcePath()
   local candidates = {
@@ -53,13 +139,23 @@ if not exists(HELPER) then
   return
 end
 
--- ---------- Persistenter Startordner ----------
-local EXTNS   = "portal_fc"
-local EXTKEY  = "open_last_dir"
-local lastdir = reaper.GetExtState(EXTNS, EXTKEY)
-if lastdir == "" then lastdir = nil end
+-- ---------- State-Datei pro Aktion ----------
+local RES = reaper.GetResourcePath()
+local CFG_DIR = join(join(RES, "Data"), "PortalFileChooser")
+if reaper.RecursiveCreateDirectory then
+  reaper.RecursiveCreateDirectory(CFG_DIR, 0)
+else
+  os.execute(string.format('mkdir -p %s', q(CFG_DIR)))
+end
+local base = (SCRIPT_NAME:gsub("%.lua$", "")):gsub("[^%w%._%-]+", "_")
+local STATE_FILE = join(CFG_DIR, base .. ".state")
 
--- ---------- Dialog-spezifische Definition (hier schlank anpassbar) ----------
+local state = load_state(STATE_FILE)
+local lastdir = state.dir
+local def_open_in_new_tab = truthy01(state.open_in_new_tab or "0")
+local def_fx_offline      = truthy01(state.fx_offline      or "0")
+
+-- ---------- Dialog-Definition ----------
 local args = {
   "--out", "-",
   "--title", "Open project (Portal)",
@@ -74,101 +170,73 @@ local args = {
   "--filter", "REAPER Project Backup files (*.RPP-BAK)|*.RPP-BAK",
   "--filter", "All files (*.*)|*.*",
   "--initial-filter", "All Supported Projects",
-  "--choice", "open_in_new_tab|Open in new project tab|false",
-  "--choice", "fx_offline|Open with FX offline (recovery mode)|false",
-  -- kein --modal: standardmäßig False (kein Abdunkeln/Sperren)
+  "--choice", ("open_in_new_tab|Open in new project tab|%s"):format(def_open_in_new_tab and "true" or "false"),
+  "--choice", ("fx_offline|Open with FX offline (recovery mode)|%s"):format(def_fx_offline and "true" or "false"),
 }
-if lastdir then
+if lastdir and lastdir ~= "" then
   table.insert(args, "--current-folder"); table.insert(args, lastdir)
 end
 
--- ---------- Kommando bauen und ausführen ----------
+-- ---------- Ausführen ----------
 local cmd = q(PY) .. " -u " .. q(HELPER)
 for i = 1, #args do cmd = cmd .. " " .. q(args[i]) end
-
 local out = run_capture_stdout(cmd)
 if not out or out == "" then return end
 
--- ---------- minimale JSON-Auswertung (zielgerichtet) ----------
--- Wir lesen nur "path" (String oder null) und zwei Choices (Booleans).
-local function json_get_string(s, key)
-  -- findet "key": "value" (ohne verschachtelte Ebenen)
-  local pat = '"'..key..'":%s*"(.-)"'
-  local v = s:match(pat)
-  if v then
-    v = v:gsub('\\"','"'):gsub("\\\\","\\")
-  end
-  return v
-end
-
-local function json_has_null(s, key)
-  local pat = '"'..key..'":%s*null'
-  return s:match(pat) ~= nil
-end
-
-local function json_get_bool(s, key)
-  local pat_true  = '"'..key..'":%s*true'
-  local pat_false = '"'..key..'":%s*false'
-  if s:match(pat_true) then return true
-  elseif s:match(pat_false) then return false
-  else return false end
-end
-
+-- ---------- Ergebnis lesen ----------
 local path = json_get_string(out, "path")
-if not path and not json_has_null(out, "path") then
-  -- Unerwartetes Format -> sicher beenden
-  return
+if not path and not json_has_null(out, "path") then return end
+
+-- ---------- Helper: alle FX offline setzen ----------
+local function set_all_fx_offline_for_project(proj)
+  local master = reaper.GetMasterTrack(proj)
+  if master then
+    local mfx = reaper.TrackFX_GetCount(master)
+    for i = 0, mfx-1 do reaper.TrackFX_SetOffline(master, i, true) end
+  end
+  local trackCount = reaper.CountTracks(proj)
+  for ti = 0, trackCount-1 do
+    local tr = reaper.GetTrack(proj, ti)
+    local fxCount = reaper.TrackFX_GetCount(tr)
+    for fi = 0, fxCount-1 do reaper.TrackFX_SetOffline(tr, fi, true) end
+  end
+  local itemCount = reaper.CountMediaItems(proj)
+  for ii = 0, itemCount-1 do
+    local item = reaper.GetMediaItem(proj, ii)
+    local takeCount = reaper.GetMediaItemNumTakes(item)
+    for tk = 0, takeCount-1 do
+      local take = reaper.GetMediaItemTake(item, tk)
+      if take then
+        local tfxCount = reaper.TakeFX_GetCount(take)
+        for tfi = 0, tfxCount-1 do reaper.TakeFX_SetOffline(take, tfi, true) end
+      end
+    end
+  end
 end
 
--- ---------- bei Auswahl: Pfad merken, Optionen anwenden, Projekt öffnen ----------
+-- ---------- Anwenden & State aktualisieren (nur bei erfolgreicher Auswahl!) ----------
 if path and path ~= "" then
-  -- Ordner merken
+  -- Ordner aktualisieren
   local dir = path:match("^(.*)[/\\]")
-  if dir and dir ~= "" then
-    reaper.SetExtState(EXTNS, EXTKEY, dir, true)
-  end
+  if dir and dir ~= "" then state.dir = dir end
 
-  -- Choices auswerten
-  local open_in_new_tab = json_get_bool(out, "open_in_new_tab")
-  local fx_offline      = json_get_bool(out, "fx_offline")
+  -- Choices aus JSON (aus dem "choices"-Objekt)
+  local open_in_new_tab = json_get_choice_bool(out, "open_in_new_tab")
+  local fx_offline      = json_get_choice_bool(out, "fx_offline")
 
-  -- Optional: neuen Projekt-Tab öffnen (Action-ID ggf. prüfen/anpassen)
-  if open_in_new_tab then
-    -- Standardmäßig ist "New project tab" die Command-ID 40859
-    reaper.Main_OnCommand(40859, 0)
-  end
+  -- State speichern (nur bei Erfolg)
+  state.open_in_new_tab = open_in_new_tab
+  state.fx_offline      = fx_offline
+  save_state(STATE_FILE, state)
 
-  -- Projekt laden
+  -- Aktion anwenden
+  if open_in_new_tab then reaper.Main_OnCommand(40859, 0) end
+  reaper.PreventUIRefresh(1)
   reaper.Main_openProject(path)
-
-  -- Optional: alle FX offline (Recovery)
   if fx_offline then
-    local proj = 0
     reaper.Undo_BeginBlock()
-    -- Track-FX
-    local trackCount = reaper.CountTracks(proj)
-    for ti = 0, trackCount-1 do
-      local tr = reaper.GetTrack(proj, ti)
-      local fxCount = reaper.TrackFX_GetCount(tr)
-      for fi = 0, fxCount-1 do
-        reaper.TrackFX_SetOffline(tr, fi, true)
-      end
-    end
-    -- Take-FX
-    local itemCount = reaper.CountMediaItems(proj)
-    for ii = 0, itemCount-1 do
-      local item = reaper.GetMediaItem(proj, ii)
-      local takeCount = reaper.GetMediaItemNumTakes(item)
-      for tk = 0, takeCount-1 do
-        local take = reaper.GetMediaItemTake(item, tk)
-        if take then
-          local tfxCount = reaper.TakeFX_GetCount(take)
-          for tfi = 0, tfxCount-1 do
-            reaper.TakeFX_SetOffline(take, tfi, true)
-          end
-        end
-      end
-    end
+    set_all_fx_offline_for_project(0)
     reaper.Undo_EndBlock("Set all FX offline (recovery)", -1)
   end
+  reaper.PreventUIRefresh(-1)
 end
