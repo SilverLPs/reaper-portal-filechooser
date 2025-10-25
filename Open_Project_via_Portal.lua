@@ -42,7 +42,7 @@ end
 
 local function main()
   -- JSON direkt von stdout lesen, Fehler nach stderr (werden ignoriert)
-  local cmd = string.format('%s -u %s --out - --err - 2>&1', q(PY), q(HELPER))
+  local cmd = string.format('%s -u %s --out -', q(PY), q(HELPER))
   local stdout = run_and_read_stdout(cmd) or ""
   local obj = parse_json(stdout)
   if not obj or obj.error or not obj.path or obj.path=="" then
