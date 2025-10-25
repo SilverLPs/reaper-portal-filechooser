@@ -21,7 +21,7 @@
 #   --initial-filter "Label"
 #   --choice "id|label|default"            (default=true/false; mehrfach)
 #   --parent "x11:0x..."
-#   --timeout 120
+#   --timeout 0                            (0 = KEIN Timeout; >0 = Sekunden)
 #   --out -                                ('-' = stdout)
 #   --err -                                (nur Debug, sonst weglassen)
 
@@ -188,12 +188,8 @@ def ay_dir_or_home(given_path):
     """
     home = os.path.expanduser("~")
     if given_path:
-        # expanduser + abspath (auflösen von . und ..), aber KEIN resolve()/realpath()
         p = os.path.abspath(os.path.expanduser(given_path))
-        if os.path.isdir(p):
-            s = p
-        else:
-            s = home
+        s = p if os.path.isdir(p) else home
     else:
         s = home
     b = os.fsencode(s) + b"\x00"
@@ -327,6 +323,7 @@ def open_via_portal(args, parent):
 
     req.connect('g-signal', on_resp)
 
+    # Timeout nur, wenn explizit > 0 übergeben wurde
     if args.timeout and args.timeout > 0:
         def on_timeout():
             if not result['done']:
@@ -362,7 +359,7 @@ def main():
 
     # Technik:
     ap.add_argument("--parent",  default=None, help="x11:0x… oder wayland:HANDLE (Override)")
-    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--timeout", type=int, default=0, help="0 = kein Timeout (Standard); >0 = Sekunden")
 
     args = ap.parse_args()
 
