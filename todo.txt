@@ -1,0 +1,11 @@
+- Adding file dialogues (if possible) for:
+  - Save project/Save project as
+  - Save new version of project
+  - Save project as template
+  - Render to file
+  - And maybe much more stuff like adding plugin folders etc.
+
+- Verifying that current-folder and current-file work in more modern versions of xdg-desktop-portal (would make the implemented last directory mechanism work, so every REAPER action would save its own last path)
+- Heavy testing under X11/Native, Wayland/Native, X11/Flatpak, Wayland/Flatpak and also GTK and KDE
+- ReaPack and automatic install and uninstall script, including adding menu entries
+- Make a README.md with before-after screenshots, explanations and easy install instructions
