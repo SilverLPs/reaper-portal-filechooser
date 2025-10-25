@@ -1,0 +1,1 @@
+**Warning: At the moment this is just a work in progress/proof of concept piece of AI scripting prototype. Do not use for the time being unless you exactly know what you are doing. Use at your own risk!**
