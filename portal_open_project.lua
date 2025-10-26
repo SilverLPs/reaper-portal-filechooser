@@ -1,6 +1,7 @@
 -- @description Open Project via xdg-desktop-portal (per-action last dir + last choices)
 -- @about
 --   Opens the native (GNOME/KDE) file chooser via xdg-desktop-portal using a Python helper.
+--   - Rejects Document-Portal paths (/run/user/<uid>/doc/...) with a user-facing error
 --   - No output to REAPER's console
 --   - Remembers the last directory and checkbox choices PER ACTION
 --   - Stores state in: REAPER/Data/PortalFileChooser/<Action>.state  (simple key=value)
@@ -21,7 +22,7 @@ local reaper = reaper
 local function script_dir_and_name()
   local _, p = reaper.get_action_context()
   local dir  = p:match("^(.*)[/\\]") or "."
-  local name = p:match("([^/\\]+)$") or "Open_Project_via_Portal.lua"
+  local name = p:match("([^/\\]+)$") or "portal_open_project.lua"
   return dir, name
 end
 
@@ -203,7 +204,7 @@ local def_fx_offline      = truthy01(state.fx_offline      or "0")
 
 local args = {
   "--out", "-",
-  "--title", "Open project (Portal)",
+  "--title", "Open project",
   "--accept-label", "_Open",
 
   -- File filters
@@ -251,6 +252,25 @@ end
 local path = json_get_string(out, "path")
 if not path and not json_has_null(out, "path") then
   -- Unexpected JSON shape → abort without side effects.
+  return
+end
+
+----------------------------------------
+-- Reject Document-Portal paths (treat like cancel)
+----------------------------------------
+
+local function is_doc_portal_path(p)
+  -- Matches /run/user/<uid>/doc/...
+  return type(p) == "string" and p:match("^/run/user/%d+/doc/") ~= nil
+end
+
+if path and is_doc_portal_path(path) then
+  reaper.MB(
+    "The selected path is outside Flatpak's allowed filesystem and was provided via the Documents portal.\n\n" ..
+    "Please choose a location that your REAPER Flatpak can access directly (e.g. inside your Home folder or a path you granted in Flatseal).",
+    "Portal", 0
+  )
+  -- Treat like cancel: do nothing further (no state updates, no project open).
   return
 end
 
