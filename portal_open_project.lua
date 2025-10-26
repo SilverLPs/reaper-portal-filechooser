@@ -205,7 +205,8 @@ local def_fx_offline      = truthy01(state.fx_offline      or "0")
 local args = {
   "--out", "-",
   "--title", "Open project",
-  "--accept-label", "_Open",
+-- Accept label should only replaced if necessary, as it destroys the localization that KDE brings by default. The localization would have to be provided manually by REAPER.
+--  "--accept-label", "_Open",
 
   -- File filters
   "--filter", "All Supported Projects|*.RPP;*.TXT;*.EDL;PROJ*.TXT;*.ADL;clipsort.log;*.RPP-BAK",

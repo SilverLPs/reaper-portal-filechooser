@@ -15,17 +15,19 @@
 #   --title "Open project"
 #   --accept-label "_Open"
 #   --multiple
-#   --directory                     (uses SelectFolder instead of OpenFile)
+#   --directory                      (uses SelectFolder)
+#   --save                           (uses SaveFile; otherwise OpenFile)
 #   --modal
-#   --current-folder "/path/to/dir" (sent as 'ay'; falls back to $HOME if invalid/empty)
-#   --current-file   "/path/to/file" (sent as 'ay'; no existence check; useful for save flows)
-#   --filter "Label|glob1;glob2;..."  (repeatable)
+#   --current-folder "/path/to/dir"  (sent as 'ay'; falls back to $HOME if invalid/empty)
+#   --current-file   "/path/to/file" (sent as 'ay'; only applied for --save; no existence check)
+#   --current-name   "Name.rpp"      (string; only applied for --save)
+#   --filter "Label|glob1;glob2;..." (repeatable)
 #   --initial-filter "Label"
-#   --choice "id|label|default"       (default in {true,false,1,0,yes,no}; repeatable)
+#   --choice "id|label|default"      (default in {true,false,1,0,yes,no}; repeatable)
 #   --parent "x11:0x..." | "wayland:HANDLE"
-#   --timeout 0                       (0 = NO timeout [default], >0 = seconds)
-#   --out -                           ('-' = stdout)
-#   --err -                           (optional debug log; omit in production)
+#   --timeout 0                      (0 = NO timeout [default], >0 = seconds)
+#   --out -                          ('-' = stdout)
+#   --err -                          (optional debug log; omit in production)
 #
 # Notes:
 #   - This script focuses on the *how* (portal call, parenting, marshalling).
@@ -339,7 +341,7 @@ def parse_choice_arg(s: str):
 
 def open_via_portal(args, parent: str | None) -> dict:
     """
-    Invoke org.freedesktop.portal.FileChooser.{OpenFile|SelectFolder} via Gio/DBus.
+    Invoke org.freedesktop.portal.FileChooser.{OpenFile|SaveFile|SelectFolder} via Gio/DBus.
     Returns a dict with keys: 'paths': [str], 'choices': {id: bool}, 'done': bool
     """
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -353,7 +355,14 @@ def open_via_portal(args, parent: str | None) -> dict:
     )
 
     title = args.title or "Open"
-    method = 'SelectFolder' if args.directory else 'OpenFile'
+
+    # Decide which method to call
+    if args.directory:
+        method = 'SelectFolder'
+    elif args.save:
+        method = 'SaveFile'
+    else:
+        method = 'OpenFile'
 
     # Base options
     opts: dict[str, GLib.Variant] = {
@@ -395,11 +404,16 @@ def open_via_portal(args, parent: str | None) -> dict:
     if current_filter_tuple:
         opts['current_filter'] = GLib.Variant('(sa(us))', current_filter_tuple)
 
-    # Optional current_file (ay) for future save flows
-    if args.current_file:
-        v = ay_file_from_path(args.current_file)
-        if v:
-            opts['current_file'] = v
+    # Save-only options
+    if args.save:
+        # Optional current_file (ay) — often honored if the file exists
+        if args.current_file:
+            v = ay_file_from_path(args.current_file)
+            if v:
+                opts['current_file'] = v
+        # Optional current_name (string) — suggested file name
+        if args.current_name:
+            opts['current_name'] = GLib.Variant('s', args.current_name)
 
     # Call the method
     params = GLib.Variant('(ssa{sv})', (parent or '', title, opts))
@@ -473,11 +487,13 @@ def main() -> int:
     ap.add_argument("--accept-label")
     ap.add_argument("--multiple", action="store_true")
     ap.add_argument("--directory", action="store_true")
+    ap.add_argument("--save", action="store_true", help="Use SaveFile instead of OpenFile")
     ap.add_argument("--modal", action="store_true")
 
     # Start folder/file (spec-compliant ay)
     ap.add_argument("--current-folder", help="Start directory; passed as ay (NUL-terminated). Fallback: $HOME.")
-    ap.add_argument("--current-file", help="Start file; passed as ay (NUL-terminated). No existence check.")
+    ap.add_argument("--current-file", help="Start file (SaveFile only); passed as ay (NUL-terminated).")
+    ap.add_argument("--current-name", help="Suggested file name (SaveFile only; plain string).")
 
     # Filters & choices
     ap.add_argument("--filter", action="append", help='Format: "Label|glob1;glob2;..." (repeatable)')
