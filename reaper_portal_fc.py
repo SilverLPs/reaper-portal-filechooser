@@ -7,9 +7,11 @@
 #   - Accepts ONLY command-line arguments (no JSON input)
 #   - Prints JSON to stdout on success: {"path", "paths", "choices"}
 #   - X11 parenting: deterministic via process-ancestor chain; modal=False (no dimming/locking)
-#   - current_folder is passed strictly per spec as 'ay' (NUL-terminated path)
+#   - For Open/SelectFolder, current_folder defaults to $HOME (spec 'ay')
+#   - For Save, current_folder is set IFF:
+#       * --current-folder is provided, OR
+#       * --current-file is NOT provided (fallback to $HOME)
 #   - Symlinks are NOT resolved (no realpath/resolve) — we use expanded/abspath strings
-#   - If the requested start folder is invalid/missing -> fall back to $HOME
 #
 # Arguments:
 #   --title "Open project"
@@ -18,9 +20,9 @@
 #   --directory                      (uses SelectFolder)
 #   --save                           (uses SaveFile; otherwise OpenFile)
 #   --modal
-#   --current-folder "/path/to/dir"  (sent as 'ay'; falls back to $HOME if invalid/empty)
-#   --current-file   "/path/to/file" (sent as 'ay'; only applied for --save; no existence check)
-#   --current-name   "Name.rpp"      (string; only applied for --save)
+#   --current-folder "/path/to/dir"  (sent as 'ay'; Open/SelectFolder: falls back to $HOME; Save: see above)
+#   --current-file   "/path/to/file" (sent as 'ay'; Save only; no existence check)
+#   --current-name   "Name.rpp"      (string; Save only; suggested file name)
 #   --filter "Label|glob1;glob2;..." (repeatable)
 #   --initial-filter "Label"
 #   --choice "id|label|default"      (default in {true,false,1,0,yes,no}; repeatable)
@@ -28,10 +30,6 @@
 #   --timeout 0                      (0 = NO timeout [default], >0 = seconds)
 #   --out -                          ('-' = stdout)
 #   --err -                          (optional debug log; omit in production)
-#
-# Notes:
-#   - This script focuses on the *how* (portal call, parenting, marshalling).
-#     The Lua scripts define the *what* (filters, choices, labels, etc.).
 
 import argparse
 import json
@@ -93,7 +91,7 @@ def which(cmd: str) -> bool:
 
 
 # =============================================================================
-# /proc helpers (build ancestor set; used to pinpoint the correct X11 parent)
+# /proc helpers (ancestor set; used to pinpoint the correct X11 parent)
 # =============================================================================
 
 def _read_text(path: str) -> str | None:
@@ -105,7 +103,6 @@ def _read_text(path: str) -> str | None:
 
 
 def _ppid(pid: int) -> int | None:
-    """Return parent PID for a given pid."""
     t = _read_text(f"/proc/{pid}/status")
     if not t:
         return None
@@ -140,11 +137,7 @@ def _exe(pid: int) -> str | None:
 
 
 def collect_ancestors() -> tuple[set[int], set[int]]:
-    """
-    Walk up the process tree from our parent and build:
-      - anc: all ancestor PIDs
-      - reaper_anc: subset where name/exe/cmdline hints at 'reaper'
-    """
+    """Return (ancestors, reaper_ancestors) PID sets walking up from our parent."""
     anc, reaper_anc = set(), set()
     pid = os.getppid()
     seen = set()
@@ -152,8 +145,8 @@ def collect_ancestors() -> tuple[set[int], set[int]]:
         seen.add(pid)
         anc.add(pid)
         name = (_comm(pid) or "").lower()
-        exe = (_exe(pid) or "").lower()
-        cmd = (_cmdline(pid) or "").lower()
+        exe  = (_exe(pid)  or "").lower()
+        cmd  = (_cmdline(pid) or "").lower()
         if ("reaper" in name) or ("reaper" in exe) or (" reaper" in cmd) or cmd.startswith("reaper"):
             reaper_anc.add(pid)
         pid = _ppid(pid)
@@ -364,13 +357,25 @@ def open_via_portal(args, parent: str | None) -> dict:
     else:
         method = 'OpenFile'
 
-    # Base options
+    # ---------------- Base options ----------------
     opts: dict[str, GLib.Variant] = {
         'multiple': GLib.Variant('b', bool(args.multiple)),
         'modal': GLib.Variant('b', bool(args.modal)),
-        # Always set current_folder per spec (ay), with a $HOME fallback.
-        'current_folder': ay_dir_or_home(args.current_folder),
     }
+
+    # current_folder handling:
+    # - Open/SelectFolder: always set (fallback to $HOME if not provided)
+    # - Save: set ONLY if:
+    #     * --current-folder is provided, OR
+    #     * --current-file is NOT provided (explicit fallback to $HOME)
+    if method in ('OpenFile', 'SelectFolder'):
+        opts['current_folder'] = ay_dir_or_home(args.current_folder)
+    else:  # SaveFile
+        if args.current_folder:
+            opts['current_folder'] = ay_dir_or_home(args.current_folder)
+        elif not args.current_file:
+            # Explicit fallback to $HOME when neither current_folder nor current_file is provided
+            opts['current_folder'] = ay_dir_or_home(None)
 
     # Optional label
     if args.accept_label:
@@ -405,17 +410,26 @@ def open_via_portal(args, parent: str | None) -> dict:
         opts['current_filter'] = GLib.Variant('(sa(us))', current_filter_tuple)
 
     # Save-only options
-    if args.save:
-        # Optional current_file (ay) — often honored if the file exists
+    if method == 'SaveFile':
+        # Optional current_file (ay)
         if args.current_file:
             v = ay_file_from_path(args.current_file)
             if v:
                 opts['current_file'] = v
-        # Optional current_name (string) — suggested file name
+            # If no explicit current_name is given, preserve the basename (with extension)
+            if not args.current_name:
+                try:
+                    base = os.path.basename(os.path.abspath(os.path.expanduser(args.current_file)))
+                except Exception:
+                    base = None
+                if base:
+                    opts['current_name'] = GLib.Variant('s', base)
+
+        # Optional current_name (string) overrides auto-basename if provided
         if args.current_name:
             opts['current_name'] = GLib.Variant('s', args.current_name)
 
-    # Call the method
+    # ---------------- Call the method ----------------
     params = GLib.Variant('(ssa{sv})', (parent or '', title, opts))
     res = fc.call_sync(method, params, 0, -1, None)
     req_path = res.unpack()[0]
@@ -491,7 +505,7 @@ def main() -> int:
     ap.add_argument("--modal", action="store_true")
 
     # Start folder/file (spec-compliant ay)
-    ap.add_argument("--current-folder", help="Start directory; passed as ay (NUL-terminated). Fallback: $HOME.")
+    ap.add_argument("--current-folder", help="Start directory; passed as ay (NUL-terminated).")
     ap.add_argument("--current-file", help="Start file (SaveFile only); passed as ay (NUL-terminated).")
     ap.add_argument("--current-name", help="Suggested file name (SaveFile only; plain string).")
 
