@@ -5,7 +5,8 @@
 #
 # Responsibilities:
 #   - Accepts ONLY command-line arguments (no JSON input)
-#   - Prints JSON to stdout on success: {"path", "paths", "choices"}
+#   - Prints JSON to stdout on success:
+#       {"path", "paths", "choices", "selected_filter_label", "selected_filter_globs"}
 #   - X11 parenting: deterministic via process-ancestor chain; modal=False (no dimming/locking)
 #   - For Open/SelectFolder, current_folder defaults to $HOME (spec 'ay')
 #   - For Save, current_folder is set IFF:
@@ -22,7 +23,7 @@
 #   --modal
 #   --current-folder "/path/to/dir"  (sent as 'ay'; Open/SelectFolder: falls back to $HOME; Save: see above)
 #   --current-file   "/path/to/file" (sent as 'ay'; Save only; no existence check)
-#   --current-name   "Name.rpp"      (string; Save only; suggested file name)
+#   --current-name   "Name.RPP"      (string; Save only; suggested file name)
 #   --filter "Label|glob1;glob2;..." (repeatable)
 #   --initial-filter "Label"
 #   --choice "id|label|default"      (default in {true,false,1,0,yes,no}; repeatable)
@@ -329,13 +330,41 @@ def parse_choice_arg(s: str):
 
 
 # =============================================================================
+# Filter helpers: expand globs for GTK (case-insensitive) but keep originals
+# =============================================================================
+
+def _dupe_case_globs(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """For each (0, 'pattern') add both upper and lower case variants."""
+    out: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for kind, pat in entries:
+        if kind != 0 or not isinstance(pat, str):
+            continue
+        ups = pat.upper()
+        lows = pat.lower()
+        for variant in (ups, lows):
+            key = (kind, variant)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
+# =============================================================================
 # Portal call (DBus)
 # =============================================================================
 
 def open_via_portal(args, parent: str | None) -> dict:
     """
     Invoke org.freedesktop.portal.FileChooser.{OpenFile|SaveFile|SelectFolder} via Gio/DBus.
-    Returns a dict with keys: 'paths': [str], 'choices': {id: bool}, 'done': bool
+    Returns:
+      {
+        'paths': [str],
+        'choices': {id: bool},
+        'selected_filter_label': str | None,
+        'selected_filter_globs': [str] | None,   # original casing as provided on input
+        'done': bool
+      }
     """
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 
@@ -364,47 +393,42 @@ def open_via_portal(args, parent: str | None) -> dict:
     }
 
     # current_folder handling:
-    # - Open/SelectFolder: always set (fallback to $HOME if not provided)
-    # - Save: set ONLY if:
-    #     * --current-folder is provided, OR
-    #     * --current-file is NOT provided (explicit fallback to $HOME)
     if method in ('OpenFile', 'SelectFolder'):
         opts['current_folder'] = ay_dir_or_home(args.current_folder)
     else:  # SaveFile
         if args.current_folder:
             opts['current_folder'] = ay_dir_or_home(args.current_folder)
         elif not args.current_file:
-            # Explicit fallback to $HOME when neither current_folder nor current_file is provided
             opts['current_folder'] = ay_dir_or_home(None)
 
     # Optional label
     if args.accept_label:
         opts['accept_label'] = GLib.Variant('s', args.accept_label)
 
-    # Choices
-    if args.choice:
-        items = []
-        for c in args.choice:
-            tup = parse_choice_arg(c)
-            if tup:
-                items.append(tup)
-        if items:
-            opts['choices'] = GLib.Variant('a(ssa(ss)s)', items)
+    # ----- Filters (and optional current_filter) -----
+    # Keep a map of original globs by label for later reverse-mapping of backend response.
+    original_globs_by_label: dict[str, list[str]] = {}
 
-    # Filters (and optional current_filter)
     current_filter_tuple = None
     if args.filter:
-        filters = []
+        filters_expanded = []
         for f in args.filter:
             tup = parse_filter_arg(f)
-            if tup:
-                filters.append(tup)
-        if filters:
-            opts['filters'] = GLib.Variant('a(sa(us))', filters)
+            if not tup:
+                continue
+            label, entries = tup
+            # Store originals (order preserved)
+            original_globs_by_label[label] = [pat for kind, pat in entries if kind == 0 and isinstance(pat, str)]
+            # Expand for GTK (case-insensitive)
+            entries_expanded = _dupe_case_globs(entries)
+            filters_expanded.append((label, entries_expanded))
+
+        if filters_expanded:
+            opts['filters'] = GLib.Variant('a(sa(us))', filters_expanded)
             if args.initial_filter:
-                for label, entries in filters:
+                for label, entries_expanded in filters_expanded:
                     if label == args.initial_filter:
-                        current_filter_tuple = (label, entries)
+                        current_filter_tuple = (label, entries_expanded)
                         break
     if current_filter_tuple:
         opts['current_filter'] = GLib.Variant('(sa(us))', current_filter_tuple)
@@ -416,7 +440,6 @@ def open_via_portal(args, parent: str | None) -> dict:
             v = ay_file_from_path(args.current_file)
             if v:
                 opts['current_file'] = v
-            # If no explicit current_name is given, preserve the basename (with extension)
             if not args.current_name:
                 try:
                     base = os.path.basename(os.path.abspath(os.path.expanduser(args.current_file)))
@@ -425,7 +448,7 @@ def open_via_portal(args, parent: str | None) -> dict:
                 if base:
                     opts['current_name'] = GLib.Variant('s', base)
 
-        # Optional current_name (string) overrides auto-basename if provided
+        # Optional current_name (string)
         if args.current_name:
             opts['current_name'] = GLib.Variant('s', args.current_name)
 
@@ -440,8 +463,56 @@ def open_via_portal(args, parent: str | None) -> dict:
         'org.freedesktop.portal.Desktop', req_path, 'org.freedesktop.portal.Request', None
     )
 
-    result = {'paths': [], 'choices': {}, 'done': False}
+    result = {
+        'paths': [],
+        'choices': {},
+        'selected_filter_label': None,
+        'selected_filter_globs': None,  # will be mapped back to originals if possible
+        'done': False
+    }
     loop = GLib.MainLoop()
+
+    def _unpack_current_filter(v):
+        """
+        Accept either a GLib.Variant('(sa(us))') or an already-unpacked tuple.
+        Returns (label:str, globs:[str]) or (None, None).
+        """
+        try:
+            label, entries = (v.unpack() if isinstance(v, GLib.Variant) else v)
+        except Exception:
+            return None, None
+        globs = []
+        try:
+            for e in entries or []:
+                if isinstance(e, (list, tuple)) and len(e) >= 2:
+                    kind, val = e[0], e[1]
+                    if kind == 0 and isinstance(val, str):
+                        globs.append(val)
+        except Exception:
+            pass
+        return label, (globs if globs else None)
+
+    def _map_backend_globs_to_originals(label: str | None, backend_globs: list[str] | None) -> list[str] | None:
+        """
+        Given the label and globs reported by the backend, return the original
+        globs (as provided by the script arguments) that case-insensitively match.
+        If no mapping is possible, return backend_globs unchanged.
+        """
+        if not label or not backend_globs:
+            return backend_globs
+        originals = original_globs_by_label.get(label)
+        if not originals:
+            return backend_globs
+        # Build lookup: lowercase -> first original with that lowercase
+        lc_map: dict[str, str] = {}
+        for og in originals:
+            key = og.lower()
+            if key not in lc_map:
+                lc_map[key] = og
+        mapped: list[str] = []
+        for g in backend_globs:
+            mapped.append(lc_map.get(g.lower(), g))
+        return mapped
 
     def on_resp(_proxy, _sender, signal, params):
         if signal != 'Response':
@@ -468,6 +539,15 @@ def open_via_portal(args, parent: str | None) -> dict:
                             if isinstance(k, str) and isinstance(v, str):
                                 tmp[k] = (v == 'true')
                     result['choices'] = tmp
+
+                # Selected filter (SaveFile only): prefer 'current_filter'
+                if method == 'SaveFile':
+                    cf = a.get('current_filter')
+                    if cf:
+                        label, globs = _unpack_current_filter(cf)
+                        result['selected_filter_label'] = label
+                        result['selected_filter_globs'] = _map_backend_globs_to_originals(label, globs)
+
             result['done'] = True
         finally:
             loop.quit()
@@ -537,7 +617,9 @@ def main() -> int:
         out = {
             "path": single,
             "paths": paths,
-            "choices": result.get('choices') or {}
+            "choices": result.get('choices') or {},
+            "selected_filter_label": result.get('selected_filter_label'),
+            "selected_filter_globs": result.get('selected_filter_globs'),
         }
         write_json(out, args.out)
         return 0

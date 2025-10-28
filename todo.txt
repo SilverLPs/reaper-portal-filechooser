@@ -9,3 +9,7 @@
 - Heavy testing under X11/Native, Wayland/Native, X11/Flatpak, Wayland/Flatpak and also GTK and KDE
 - ReaPack and automatic install and uninstall script, including adding menu entries
 - Make a README.md with before-after screenshots, explanations and easy install instructions
+
+- The KDE dialog is smart enough to show both RPP and rpp but the GTK dialog will only show RPP if the filter is set. Switching the filter to .rpp and .RPP would solve that but it would also make it so that multiple extensions will be returned to the Lua script which could invoke new problems. Maybe there is common publicly known solution to this.
+
+- Python script has a fallback to selected_filter if current_filter isn't received in DBus method_return. But selected_filter is unspecified in xdg-desktop-portals, it is probably completely unnecessary and should be removed. In fact no fallback should be necessary, not even to RPP, because falling back to RPP is the job of the Lua script.
