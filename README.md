@@ -7,12 +7,12 @@ Switching KDE/GTK dialogues:
 Using a KDE based distro (in a virtual machine) like the newest Kubuntu is recommended because it will have both the KDE and the GTK portal backends for the file dialogs preinstalled.
 In /home/silver/.config/xdg-desktop-portal/portals.conf enter the following:
 
-[preferred]
-org.freedesktop.impl.portal.FileChooser=gtk
+    [preferred]
+    org.freedesktop.impl.portal.FileChooser=gtk
 
 This will switch to the GTK dialog after restarting the portal services with:
-systemctl --user restart xdg-desktop-portal
-systemctl --user restart xdg-desktop-portal-gtk.service
+
+    systemctl --user restart xdg-desktop-portal xdg-desktop-portal-gtk
 
 By commenting the lines in the config or by replacing "gtk" with "kde", the portal will switch back to the KDE file dialog .
 

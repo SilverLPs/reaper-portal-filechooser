@@ -220,9 +220,9 @@ local args = {
   "--filter", "All files (*.*)|*.*",
   "--initial-filter", "All Supported Projects",
 
-  -- Choices with defaults from persisted state
-  "--choice", ("open_in_new_tab|Open in new project tab|%s"):format(def_open_in_new_tab and "true" or "false"),
-  "--choice", ("fx_offline|Open with FX offline (recovery mode)|%s"):format(def_fx_offline and "true" or "false"),
+  -- Options with defaults from persisted state (checkboxes)
+  "--option", ("check|open_in_new_tab|Open in new project tab|%s"):format(def_open_in_new_tab and "true" or "false"),
+  "--option", ("check|fx_offline|Open with FX offline (recovery mode)|%s"):format(def_fx_offline and "true" or "false"),
 }
 
 -- Preferred start directory (helper will fall back to $HOME if invalid)

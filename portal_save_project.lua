@@ -125,6 +125,16 @@ local function json_get_string_array(json, key)
   return arr
 end
 
+-- extract string value from "choices_raw" object (for selects)
+local function json_get_choice_raw(json, choice_key)
+  local block = json:match([["choices_raw"%s*:%s*{(.-)}]])
+  if not block then return nil end
+  local pat = '"'..choice_key..'":%s*"(.-)"'
+  local v = block:match(pat)
+  if v then v = v:gsub('\\"','"'):gsub("\\\\","\\") end
+  return v
+end
+
 ----------------------------------------
 -- Locate Python helper
 ----------------------------------------
@@ -200,8 +210,9 @@ local args = {
   "--filter", "All files (*.*)|*.*",
   "--initial-filter", "REAPER Project files (*.RPP)",
 
-  -- Persisted checkbox
-  "--choice", ("create_subdir|Create subdirectory for project|%s"):format(def_create_subdir and "true" or "false"),
+  -- Options
+  "--option", ("check|create_subdir|Create subdirectory for project|%s"):format(def_create_subdir and "true" or "false"),
+  "--option", "select|media_handling|Media handling|none:None;copy:Copy;copy_conv:Copy & Convert;move:Move;move_oldpath:Move only if media in old project media path|none",
 }
 
 -- Start hint priority
@@ -242,6 +253,11 @@ end
 -- Filter info from helper (if backend provided it)
 local selected_filter_label = json_get_string(out, "selected_filter_label")
 local selected_filter_globs = json_get_string_array(out, "selected_filter_globs")
+
+-- (Placeholder) Media handling selection (not persisted, not applied)
+local media_handling = json_get_choice_raw(out, "media_handling") or "none"
+-- values: "none" | "copy" | "copy_conv" | "move" | "move_oldpath"
+-- currently unused (placeholder)
 
 ----------------------------------------
 -- Utilities

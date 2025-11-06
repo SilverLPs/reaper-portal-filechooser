@@ -3,34 +3,27 @@
 #
 # Generic xdg-desktop-portal FileChooser (Gio/DBus only)
 #
-# Responsibilities:
-#   - Accepts ONLY command-line arguments (no JSON input)
-#   - Prints JSON to stdout on success:
-#       {"path", "paths", "choices", "selected_filter_label", "selected_filter_globs"}
-#   - X11 parenting: deterministic via process-ancestor chain; modal=False (no dimming/locking)
-#   - For Open/SelectFolder, current_folder defaults to $HOME (spec 'ay')
-#   - For Save, current_folder is set IFF:
-#       * --current-folder is provided, OR
-#       * --current-file is NOT provided (fallback to $HOME)
-#   - Symlinks are NOT resolved (no realpath/resolve) — we use expanded/abspath strings
+# Outputs JSON:
+# {
+#   "path", "paths",
+#   "choices",       # booleans for checkbox entries (compat for easy use)
+#   "choices_raw",   # strings for all entries (checkbox: "true"/"false"; select: selected option id)
+#   "selected_filter_label",
+#   "selected_filter_globs"
+# }
 #
-# Arguments:
-#   --title "Open project"
-#   --accept-label "_Open"
-#   --multiple
-#   --directory                      (uses SelectFolder)
-#   --save                           (uses SaveFile; otherwise OpenFile)
-#   --modal
-#   --current-folder "/path/to/dir"  (sent as 'ay'; Open/SelectFolder: falls back to $HOME; Save: see above)
-#   --current-file   "/path/to/file" (sent as 'ay'; Save only; no existence check)
-#   --current-name   "Name.RPP"      (string; Save only; suggested file name)
-#   --filter "Label|glob1;glob2;..." (repeatable)
-#   --initial-filter "Label"
-#   --choice "id|label|default"      (default in {true,false,1,0,yes,no}; repeatable)
-#   --parent "x11:0x..." | "wayland:HANDLE"
-#   --timeout 0                      (0 = NO timeout [default], >0 = seconds)
-#   --out -                          ('-' = stdout)
-#   --err -                          (optional debug log; omit in production)
+# Highlights:
+# - Use --option for ordered custom UI:
+#     Checkbox: --option "check|id|Label|true"
+#     Select:   --option "select|id|Label|optId1:Opt 1;optId2:Opt 2|defaultId"
+# - Case-insensitive GTK filter workaround (duplicates *.EXT and *.ext internally),
+#   while returning the original globs back in JSON (no duplicates).
+#
+# Notes:
+# - For Open/SelectFolder, current_folder defaults to $HOME (spec 'ay').
+# - For Save, current_folder is set IFF:
+#     * --current-folder is provided, OR
+#     * --current-file is NOT provided (fallback to $HOME).
 
 import argparse
 import json
@@ -49,50 +42,38 @@ from gi.repository import Gio, GLib
 
 
 # =============================================================================
-# I/O utilities
+# I/O
 # =============================================================================
 
 def write_json(obj, out_target: str) -> None:
-    """Write JSON to stdout or to a file atomically."""
     data = json.dumps(obj)
     if out_target == "-":
-        sys.stdout.write(data)
-        sys.stdout.flush()
+        sys.stdout.write(data); sys.stdout.flush()
     else:
-        tmp = f"{out_target}.tmp-{int(time.time() * 1e6)}"
+        tmp = f"{out_target}.tmp-{int(time.time()*1e6)}"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+            f.write(data); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, out_target)
 
 
 def log_err(msg: str, err_target: str | None) -> None:
-    """Append a line to the error target (stderr or file)."""
-    if not err_target:
-        return
+    if not err_target: return
     line = msg if msg.endswith("\n") else msg + "\n"
     if err_target == "-":
-        try:
-            sys.stderr.write(line)
-            sys.stderr.flush()
-        except Exception:
-            pass
+        try: sys.stderr.write(line); sys.stderr.flush()
+        except Exception: pass
     else:
         try:
-            with open(err_target, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception:
-            pass
+            with open(err_target, "a", encoding="utf-8") as f: f.write(line)
+        except Exception: pass
 
 
 def which(cmd: str) -> bool:
-    """Return True if executable is found in PATH."""
     return shutil.which(cmd) is not None
 
 
 # =============================================================================
-# /proc helpers (ancestor set; used to pinpoint the correct X11 parent)
+# /proc helpers (X11 parenting)
 # =============================================================================
 
 def _read_text(path: str) -> str | None:
@@ -102,33 +83,26 @@ def _read_text(path: str) -> str | None:
     except Exception:
         return None
 
-
 def _ppid(pid: int) -> int | None:
     t = _read_text(f"/proc/{pid}/status")
-    if not t:
-        return None
+    if not t: return None
     for line in t.splitlines():
         if line.startswith("PPid:"):
-            try:
-                return int(line.split()[1])
-            except Exception:
-                return None
+            try: return int(line.split()[1])
+            except Exception: return None
     return None
-
 
 def _comm(pid: int) -> str | None:
     t = _read_text(f"/proc/{pid}/comm")
     return t.strip() if t else None
 
-
 def _cmdline(pid: int) -> str | None:
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            parts = [p.decode("utf-8", "ignore") for p in f.read().split(b"\x00") if p]
+            parts = [p.decode("utf-8","ignore") for p in f.read().split(b"\x00") if p]
         return " ".join(parts) if parts else None
     except Exception:
         return None
-
 
 def _exe(pid: int) -> str | None:
     try:
@@ -136,15 +110,12 @@ def _exe(pid: int) -> str | None:
     except Exception:
         return None
 
-
 def collect_ancestors() -> tuple[set[int], set[int]]:
-    """Return (ancestors, reaper_ancestors) PID sets walking up from our parent."""
     anc, reaper_anc = set(), set()
     pid = os.getppid()
     seen = set()
     while pid and pid not in seen and pid > 0:
-        seen.add(pid)
-        anc.add(pid)
+        seen.add(pid); anc.add(pid)
         name = (_comm(pid) or "").lower()
         exe  = (_exe(pid)  or "").lower()
         cmd  = (_cmdline(pid) or "").lower()
@@ -155,7 +126,7 @@ def collect_ancestors() -> tuple[set[int], set[int]]:
 
 
 # =============================================================================
-# X11 helpers (xprop), window selection for parenting
+# X11 helpers
 # =============================================================================
 
 def _xprop(args: list[str]) -> str:
@@ -164,112 +135,77 @@ def _xprop(args: list[str]) -> str:
     except Exception:
         return ""
 
-
 def _parse_ids(s: str) -> list[str]:
-    """Extract hex window ids (e.g., '0x5c02b2e') from xprop output."""
-    ids = []
-    for token in s.replace("\n", " ").split(","):
-        token = token.strip()
-        if not token:
-            continue
+    ids=[]
+    for token in s.replace("\n"," ").split(","):
+        token=token.strip()
+        if not token: continue
         wid = token.split()[-1]
-        if wid.startswith("0x"):
-            ids.append(wid.lower())
+        if wid.startswith("0x"): ids.append(wid.lower())
     return ids
 
-
 def _pid_of_win(wid: str) -> int | None:
-    s = _xprop(["-id", wid, "_NET_WM_PID"])
+    s=_xprop(["-id", wid, "_NET_WM_PID"])
     if "=" in s:
-        try:
-            return int(s.split("=")[-1].strip())
-        except Exception:
-            return None
+        try: return int(s.split("=")[-1].strip())
+        except Exception: return None
     return None
 
-
 def _wm_class_has_reaper(wid: str) -> bool:
-    s = _xprop(["-id", wid, "WM_CLASS"])
-    m = re.search(r'WM_CLASS\(.*\)\s*=\s*(.+)$', s)
-    if not m:
-        return False
+    s=_xprop(["-id", wid, "WM_CLASS"])
+    m=re.search(r'WM_CLASS\(.*\)\s*=\s*(.+)$', s)
+    if not m: return False
     return "reaper" in m.group(1).lower()
 
-
 def _types(wid: str) -> list[str]:
-    s = _xprop(["-id", wid, "_NET_WM_WINDOW_TYPE"])
+    s=_xprop(["-id", wid, "_NET_WM_WINDOW_TYPE"])
     return [t.strip() for t in s.split("=")[-1].split(",")] if "=" in s else []
-
 
 def _is_normal(wid: str) -> bool:
     return any("_NET_WM_WINDOW_TYPE_NORMAL" in t for t in _types(wid))
 
-
 def _has_transient_for(wid: str) -> bool:
-    s = _xprop(["-id", wid, "WM_TRANSIENT_FOR"])
+    s=_xprop(["-id", wid, "WM_TRANSIENT_FOR"])
     return "window id" in s.lower()
 
-
 def detect_parent_x11_via_anc(err_target: str | None) -> str | None:
-    """
-    Select a stable X11 parent window belonging to our process tree (prefer REAPER ancestors).
-    Returns 'x11:0xABC...' or None.
-    """
-    if (os.getenv("XDG_SESSION_TYPE") or "").lower() == "wayland":
-        return None
-    if os.getenv("PORTAL_NO_PARENT") == "1":
-        return None
-    if not which("xprop"):
-        return None
+    if (os.getenv("XDG_SESSION_TYPE") or "").lower()=="wayland": return None
+    if os.getenv("PORTAL_NO_PARENT")=="1": return None
+    if not which("xprop"): return None
 
-    forced = os.getenv("PORTAL_PARENT")
-    if forced and forced.startswith("x11:"):
-        return forced
+    forced=os.getenv("PORTAL_PARENT")
+    if forced and forced.startswith("x11:"): return forced
 
     ancestors, reaper_anc = collect_ancestors()
 
-    # Prefer stacking order for "front-most" candidate; fall back to client list.
-    stack = _xprop(["-root", "_NET_CLIENT_LIST_STACKING"])
-    ids = list(reversed(_parse_ids(stack)))
+    stack=_xprop(["-root","_NET_CLIENT_LIST_STACKING"])
+    ids=list(reversed(_parse_ids(stack)))
     if not ids:
-        cl = _xprop(["-root", "_NET_CLIENT_LIST"])
-        ids = _parse_ids(cl)
+        cl=_xprop(["-root","_NET_CLIENT_LIST"])
+        ids=_parse_ids(cl)
 
-    best = None
-    best_pref = -1  # 2: pid in reaper_anc; 1: pid in ancestors
-
+    best=None
+    best_pref=-1  # 2: pid in reaper_anc; 1: pid in ancestors
     for wid in ids:
-        if not _is_normal(wid):
-            continue
-        if _has_transient_for(wid):
-            continue
-        if not _wm_class_has_reaper(wid):
-            continue
-        pid = _pid_of_win(wid)
-        if pid is None:
-            continue
-        if pid not in ancestors:
-            continue
-        pref = 2 if pid in reaper_anc else 1
-        if pref > best_pref:
-            best_pref = pref
-            best = wid
-            if pref == 2:
-                break
+        if not _is_normal(wid): continue
+        if _has_transient_for(wid): continue
+        if not _wm_class_has_reaper(wid): continue
+        pid=_pid_of_win(wid)
+        if pid is None: continue
+        if pid not in ancestors: continue
+        pref=2 if pid in reaper_anc else 1
+        if pref>best_pref:
+            best_pref=pref; best=wid
+            if pref==2: break
 
-    return ("x11:" + best) if best else None
+    return ("x11:"+best) if best else None
 
 
 # =============================================================================
-# Path -> 'ay' marshalling (NUL-terminated); symlinks NOT resolved
+# Path -> 'ay'
 # =============================================================================
 
 def ay_dir_or_home(given_path: str | None) -> GLib.Variant:
-    """
-    Return GLib.Variant('ay') for a directory path (NUL-terminated).
-    - DO NOT resolve symlinks
-    - If given_path is invalid/missing -> $HOME
-    """
     home = os.path.expanduser("~")
     if given_path:
         p = os.path.abspath(os.path.expanduser(given_path))
@@ -279,96 +215,88 @@ def ay_dir_or_home(given_path: str | None) -> GLib.Variant:
     b = os.fsencode(s) + b"\x00"
     return GLib.Variant('ay', b)
 
-
 def ay_file_from_path(given_path: str | None) -> GLib.Variant | None:
-    """
-    Return GLib.Variant('ay') for a file path (NUL-terminated).
-    - DO NOT resolve symlinks
-    - No existence check (useful for planned save flows)
-    """
-    if not given_path:
-        return None
+    if not given_path: return None
     s = os.path.abspath(os.path.expanduser(given_path))
     b = os.fsencode(s) + b"\x00"
     return GLib.Variant('ay', b)
 
 
 # =============================================================================
-# Argument -> Variant conversion helpers
+# Options (checkbox/select)
 # =============================================================================
 
-def parse_filter_arg(s: str):
+def parse_option_arg(s: str):
     """
-    Parse a filter of form: "Label|glob1;glob2;glob3"
-      -> returns (label: str, entries: list[(0, glob)])
+    Checkbox: 'check|id|Label|true'  or 'checkbox|id|Label|false'
+    Select:   'select|id|Label|optId1:Opt 1;optId2:Opt 2|defaultId'
+    Returns (id, label, options:list[(id,label)], defaultStr)
+      - For checkbox, options=[]
+      - For select,  options=[(optId,optLabel),...], defaultStr=selected optId
     """
-    if "|" not in s:
+    parts = s.split("|", 3)  # allow labels with '|'
+    if len(parts) < 3:
         return None
-    label, rest = s.split("|", 1)
-    globs = [g.strip() for g in rest.split(";") if g.strip()]
-    if not label.strip() or not globs:
-        return None
-    entries = [(0, g) for g in globs]  # 0 = glob
-    return (label.strip(), entries)
+    typ = parts[0].strip().lower()
+    cid = parts[1].strip()
+    lab = parts[2].strip() or cid
 
+    if typ in ("check","checkbox"):
+        dft = (parts[3].strip().lower() if len(parts) >= 4 else "false")
+        truthy = {"true","1","yes","y","on"}
+        default = "true" if dft in truthy else "false"
+        return (cid, lab, [], default)
 
-def parse_choice_arg(s: str):
-    """
-    Parse a choice of form: "id|label|default"
-      default in {true,false,1,0,yes,no} -> stored as "true"/"false" string
-      returns tuple matching a(ssa(ss)s)
-    """
-    parts = s.split("|")
-    if len(parts) < 2:
-        return None
-    cid = parts[0].strip()
-    lab = parts[1].strip() or cid
-    dft = (parts[2].strip().lower() if len(parts) >= 3 else "false")
-    truthy = {"true", "1", "yes", "y", "on"}
-    default = "true" if dft in truthy else "false"
-    return (cid, lab, [], default)  # a(ssa(ss)s)
+    if typ in ("select","dropdown","combo"):
+        if len(parts) < 4:
+            return None
+        opt_and_default = parts[3]
+        if "|" in opt_and_default:
+            opt_str, default_id = opt_and_default.rsplit("|", 1)
+        else:
+            opt_str, default_id = opt_and_default, ""
+        options = []
+        for tok in opt_str.split(";"):
+            tok = tok.strip()
+            if not tok: continue
+            if ":" in tok:
+                oid, olab = tok.split(":", 1)
+                options.append((oid.strip(), olab.strip()))
+            else:
+                oid = tok.strip()
+                options.append((oid, oid))
+        default = default_id.strip() if default_id.strip() else (options[0][0] if options else "")
+        return (cid, lab, options, default)
+
+    return None
 
 
 # =============================================================================
-# Filter helpers: expand globs for GTK (case-insensitive) but keep originals
+# Filters (GTK case-insensitive dup)
 # =============================================================================
 
 def _dupe_case_globs(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
-    """For each (0, 'pattern') add both upper and lower case variants."""
-    out: list[tuple[int, str]] = []
-    seen: set[tuple[int, str]] = set()
+    out=[]; seen=set()
     for kind, pat in entries:
-        if kind != 0 or not isinstance(pat, str):
-            continue
-        ups = pat.upper()
-        lows = pat.lower()
+        if kind != 0 or not isinstance(pat,str): continue
+        ups = pat.upper(); lows = pat.lower()
         for variant in (ups, lows):
-            key = (kind, variant)
+            key=(kind, variant)
             if key not in seen:
-                seen.add(key)
-                out.append(key)
+                seen.add(key); out.append(key)
     return out
 
 
 # =============================================================================
-# Portal call (DBus)
+# Portal call
 # =============================================================================
 
 def open_via_portal(args, parent: str | None) -> dict:
     """
-    Invoke org.freedesktop.portal.FileChooser.{OpenFile|SaveFile|SelectFolder} via Gio/DBus.
-    Returns:
-      {
-        'paths': [str],
-        'choices': {id: bool},
-        'selected_filter_label': str | None,
-        'selected_filter_globs': [str] | None,   # original casing as provided on input
-        'done': bool
-      }
+    Invoke org.freedesktop.portal.FileChooser.{OpenFile|SaveFile|SelectFolder}.
     """
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-
-    fc = Gio.DBusProxy.new_sync(
+    fc  = Gio.DBusProxy.new_sync(
         bus, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
         'org.freedesktop.portal.Desktop',
         '/org/freedesktop/portal/desktop',
@@ -377,8 +305,6 @@ def open_via_portal(args, parent: str | None) -> dict:
     )
 
     title = args.title or "Open"
-
-    # Decide which method to call
     if args.directory:
         method = 'SelectFolder'
     elif args.save:
@@ -386,43 +312,61 @@ def open_via_portal(args, parent: str | None) -> dict:
     else:
         method = 'OpenFile'
 
-    # ---------------- Base options ----------------
     opts: dict[str, GLib.Variant] = {
         'multiple': GLib.Variant('b', bool(args.multiple)),
-        'modal': GLib.Variant('b', bool(args.modal)),
+        'modal':    GLib.Variant('b', bool(args.modal)),
     }
 
-    # current_folder handling:
-    if method in ('OpenFile', 'SelectFolder'):
+    # current_folder
+    if method in ('OpenFile','SelectFolder'):
         opts['current_folder'] = ay_dir_or_home(args.current_folder)
-    else:  # SaveFile
+    else:
         if args.current_folder:
             opts['current_folder'] = ay_dir_or_home(args.current_folder)
         elif not args.current_file:
             opts['current_folder'] = ay_dir_or_home(None)
 
-    # Optional label
     if args.accept_label:
         opts['accept_label'] = GLib.Variant('s', args.accept_label)
 
-    # ----- Filters (and optional current_filter) -----
-    # Keep a map of original globs by label for later reverse-mapping of backend response.
-    original_globs_by_label: dict[str, list[str]] = {}
+    # ----- Build ordered choices from --option (preserve CLI order) -----
+    choice_items = []
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--option" and i+1 < len(argv):
+            parsed = parse_option_arg(argv[i+1])
+            if parsed:
+                choice_items.append(parsed)
+            i += 2
+            continue
+        # generic skip of flag+value
+        if tok.startswith("--") and (i+1) < len(argv) and not argv[i+1].startswith("--"):
+            i += 2
+        else:
+            i += 1
 
+    if choice_items:
+        # a(ssa(ss)s)
+        opts['choices'] = GLib.Variant('a(ssa(ss)s)', [
+            (cid, lab, options, default) for (cid, lab, options, default) in choice_items
+        ])
+
+    # ----- Filters (expand for GTK, keep originals for returning) -----
+    original_globs_by_label = {}
     current_filter_tuple = None
     if args.filter:
         filters_expanded = []
         for f in args.filter:
-            tup = parse_filter_arg(f)
-            if not tup:
-                continue
-            label, entries = tup
-            # Store originals (order preserved)
-            original_globs_by_label[label] = [pat for kind, pat in entries if kind == 0 and isinstance(pat, str)]
-            # Expand for GTK (case-insensitive)
+            if "|" not in f: continue
+            label, rest = f.split("|", 1)
+            globs = [g.strip() for g in rest.split(";") if g.strip()]
+            if not label.strip() or not globs: continue
+            entries = [(0, g) for g in globs]
+            original_globs_by_label[label] = [pat for _, pat in entries]
             entries_expanded = _dupe_case_globs(entries)
             filters_expanded.append((label, entries_expanded))
-
         if filters_expanded:
             opts['filters'] = GLib.Variant('a(sa(us))', filters_expanded)
             if args.initial_filter:
@@ -433,13 +377,11 @@ def open_via_portal(args, parent: str | None) -> dict:
     if current_filter_tuple:
         opts['current_filter'] = GLib.Variant('(sa(us))', current_filter_tuple)
 
-    # Save-only options
+    # Save-only extras
     if method == 'SaveFile':
-        # Optional current_file (ay)
         if args.current_file:
             v = ay_file_from_path(args.current_file)
-            if v:
-                opts['current_file'] = v
+            if v: opts['current_file'] = v
             if not args.current_name:
                 try:
                     base = os.path.basename(os.path.abspath(os.path.expanduser(args.current_file)))
@@ -447,17 +389,14 @@ def open_via_portal(args, parent: str | None) -> dict:
                     base = None
                 if base:
                     opts['current_name'] = GLib.Variant('s', base)
-
-        # Optional current_name (string)
         if args.current_name:
             opts['current_name'] = GLib.Variant('s', args.current_name)
 
-    # ---------------- Call the method ----------------
+    # ---- Call ----
     params = GLib.Variant('(ssa{sv})', (parent or '', title, opts))
     res = fc.call_sync(method, params, 0, -1, None)
     req_path = res.unpack()[0]
 
-    # Listen for the async response
     req = Gio.DBusProxy.new_sync(
         bus, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
         'org.freedesktop.portal.Desktop', req_path, 'org.freedesktop.portal.Request', None
@@ -465,28 +404,25 @@ def open_via_portal(args, parent: str | None) -> dict:
 
     result = {
         'paths': [],
-        'choices': {},
+        'choices': {},       # checkbox booleans
+        'choices_raw': {},   # strings for all
         'selected_filter_label': None,
-        'selected_filter_globs': None,  # will be mapped back to originals if possible
+        'selected_filter_globs': None,
         'done': False
     }
     loop = GLib.MainLoop()
 
     def _unpack_current_filter(v):
-        """
-        Accept either a GLib.Variant('(sa(us))') or an already-unpacked tuple.
-        Returns (label:str, globs:[str]) or (None, None).
-        """
         try:
             label, entries = (v.unpack() if isinstance(v, GLib.Variant) else v)
         except Exception:
             return None, None
-        globs = []
+        globs=[]
         try:
             for e in entries or []:
-                if isinstance(e, (list, tuple)) and len(e) >= 2:
+                if isinstance(e,(list,tuple)) and len(e)>=2:
                     kind, val = e[0], e[1]
-                    if kind == 0 and isinstance(val, str):
+                    if kind == 0 and isinstance(val,str):
                         globs.append(val)
         except Exception:
             pass
@@ -494,59 +430,65 @@ def open_via_portal(args, parent: str | None) -> dict:
 
     def _map_backend_globs_to_originals(label: str | None, backend_globs: list[str] | None) -> list[str] | None:
         """
-        Given the label and globs reported by the backend, return the original
-        globs (as provided by the script arguments) that case-insensitively match.
-        If no mapping is possible, return backend_globs unchanged.
+        Map backend-returned globs (which may include our GTK case-duplication)
+        back to the *original* globs that were provided via --filter.
+        If originals for the label are known, return them exactly (order + casing).
+        Otherwise, return backend globs de-duplicated case-insensitively.
         """
-        if not label or not backend_globs:
+        if not label:
             return backend_globs
+
         originals = original_globs_by_label.get(label)
-        if not originals:
+        if originals:
+            # Return exactly what the caller supplied for this label.
+            return list(originals)
+
+        # Fallback: dedupe backend_globs case-insensitively, keep first occurrence
+        if not backend_globs:
             return backend_globs
-        # Build lookup: lowercase -> first original with that lowercase
-        lc_map: dict[str, str] = {}
-        for og in originals:
-            key = og.lower()
-            if key not in lc_map:
-                lc_map[key] = og
-        mapped: list[str] = []
+        seen = set()
+        out = []
         for g in backend_globs:
-            mapped.append(lc_map.get(g.lower(), g))
-        return mapped
+            key = g.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(g)
+        return out
 
     def on_resp(_proxy, _sender, signal, params):
-        if signal != 'Response':
-            return
+        if signal != 'Response': return
         try:
-            code, a = params.unpack()  # (u, a{sv})
+            code, a = params.unpack()
             if code == 0:
-                uris = a.get('uris', [])
-                ch = a.get('choices', {})
-                # URIs -> file paths
-                for uri in uris or []:
-                    if isinstance(uri, str) and uri.startswith("file://"):
+                for uri in a.get('uris', []) or []:
+                    if isinstance(uri,str) and uri.startswith("file://"):
                         result['paths'].append(unquote(uri[7:]))
-                    elif isinstance(uri, str):
+                    elif isinstance(uri,str):
                         result['paths'].append(uri)
-                # Choices -> {id: bool}
-                if isinstance(ch, dict):
-                    result['choices'] = {k: (v == 'true') for k, v in ch.items()}
-                elif isinstance(ch, (list, tuple)):
-                    tmp = {}
-                    for item in ch:
-                        if isinstance(item, (list, tuple)) and len(item) >= 2:
-                            k, v = item[0], item[1]
-                            if isinstance(k, str) and isinstance(v, str):
-                                tmp[k] = (v == 'true')
-                    result['choices'] = tmp
 
-                # Selected filter (SaveFile only): prefer 'current_filter'
-                if method == 'SaveFile':
-                    cf = a.get('current_filter')
-                    if cf:
-                        label, globs = _unpack_current_filter(cf)
-                        result['selected_filter_label'] = label
-                        result['selected_filter_globs'] = _map_backend_globs_to_originals(label, globs)
+                ch = a.get('choices', {})
+                if isinstance(ch, dict):
+                    for k, v in ch.items():
+                        if not isinstance(k, str): continue
+                        if isinstance(v, str):
+                            result['choices_raw'][k] = v
+                            if v in ("true","false"):
+                                result['choices'][k] = (v == "true")
+                elif isinstance(ch,(list,tuple)):
+                    for item in ch:
+                        if isinstance(item,(list,tuple)) and len(item)>=2:
+                            k, v = item[0], item[1]
+                            if isinstance(k,str) and isinstance(v,str):
+                                result['choices_raw'][k] = v
+                                if v in ("true","false"):
+                                    result['choices'][k] = (v=="true")
+
+                cf = a.get('current_filter')
+                if cf:
+                    label, globs = _unpack_current_filter(cf)
+                    result['selected_filter_label'] = label
+                    result['selected_filter_globs'] = _map_backend_globs_to_originals(label, globs)
 
             result['done'] = True
         finally:
@@ -554,12 +496,10 @@ def open_via_portal(args, parent: str | None) -> dict:
 
     req.connect('g-signal', on_resp)
 
-    # Optional timeout: only if explicitly > 0 (default is 0 = no timeout)
     if args.timeout and args.timeout > 0:
         def on_timeout():
             if not result['done']:
-                result['done'] = True
-                loop.quit()
+                result['done'] = True; loop.quit()
             return False
         GLib.timeout_add_seconds(args.timeout, on_timeout)
 
@@ -584,15 +524,16 @@ def main() -> int:
     ap.add_argument("--save", action="store_true", help="Use SaveFile instead of OpenFile")
     ap.add_argument("--modal", action="store_true")
 
-    # Start folder/file (spec-compliant ay)
+    # Start folder/file
     ap.add_argument("--current-folder", help="Start directory; passed as ay (NUL-terminated).")
     ap.add_argument("--current-file", help="Start file (SaveFile only); passed as ay (NUL-terminated).")
     ap.add_argument("--current-name", help="Suggested file name (SaveFile only; plain string).")
 
-    # Filters & choices
+    # Filters & ordered options
     ap.add_argument("--filter", action="append", help='Format: "Label|glob1;glob2;..." (repeatable)')
     ap.add_argument("--initial-filter", help="Label of one of the provided --filter entries")
-    ap.add_argument("--choice", action="append", help='Format: "id|label|default" (default=true/false; repeatable)')
+    ap.add_argument("--option", action="append",
+                    help='Checkbox: "check|id|Label|true";  Select: "select|id|Label|optId1:Opt 1;optId2:Opt 2|defaultId"')
 
     # Plumbing
     ap.add_argument("--parent", default=None, help="x11:0x… or wayland:HANDLE (override)")
@@ -601,7 +542,6 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        # Auto-detect X11 parent (deterministic via ancestor chain)
         parent = None
         if os.getenv("PORTAL_NO_PARENT") != "1":
             if args.parent:
@@ -617,7 +557,8 @@ def main() -> int:
         out = {
             "path": single,
             "paths": paths,
-            "choices": result.get('choices') or {},
+            "choices": result.get('choices') or {},            # booleans (checkbox)
+            "choices_raw": result.get('choices_raw') or {},    # strings (checkbox + select)
             "selected_filter_label": result.get('selected_filter_label'),
             "selected_filter_globs": result.get('selected_filter_globs'),
         }
