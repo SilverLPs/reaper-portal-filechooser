@@ -13,6 +13,14 @@ The accompanying **Lua script** demonstrates how such integration could look ins
 It is limited by the ReaScript API but serves as a conceptual reference for a potential native implementation.
 See the list of shortcomings below for details.
 
+**Open project:**
+
+<img src="screencaps/reaper_open.png" width="49%"></img> <img src="screencaps/kde_open.png" width="49%"></img> <img src="screencaps/gtk_open.png" width="49%"></img> <img src="screencaps/gnome_open.png" width="49%"></img>
+
+**Save project:**
+
+<img src="screencaps/reaper_save.png" width="49%"></img> <img src="screencaps/kde_save.png" width="49%"></img> <img src="screencaps/gtk_save.png" width="49%"></img> <img src="screencaps/gnome_save.png" width="49%"></img>
+
 ## Features/Advantages
 
 - Works with both native and Flatpak installations of REAPER.
