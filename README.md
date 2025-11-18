@@ -1,22 +1,76 @@
-**Warning: At the moment this is just a work in progress/proof of concept piece of AI scripting prototype. Do not use for the time being unless you exactly know what you are doing. Use at your own risk!**
+# REAPER Portal FileChooser (Demo)
 
-Live log DBus method_returns:
-dbus-monitor --session "type='method_return'"
+**⚠️ Warning:** This is a **proof-of-concept** demo showing how native DBus portal file choosers could be integrated into REAPER.
+It is **not intended for production use**. Use only if you fully understand what it does - at your own risk!
 
-Switching KDE/GTK dialogues:
-Using a KDE based distro (in a virtual machine) like the newest Kubuntu is recommended because it will have both the KDE and the GTK portal backends for the file dialogs preinstalled.
-In /home/silver/.config/xdg-desktop-portal/portals.conf enter the following:
+## Overview
+
+The included **Python script** is application-agnostic.
+It performs generic DBus calls to the xdg-desktop-portal service to open native file choosers, receives their responses, and outputs the result as JSON.
+Run it with `--help` to see all supported options. It covers most parameters currently available in portal file choosers.
+
+The accompanying **Lua script** demonstrates how such integration could look inside REAPER.
+It is limited by the ReaScript API but serves as a conceptual reference for a potential native implementation.
+See the list of shortcomings below for details.
+
+## Features/Advantages
+
+- Works with both native and Flatpak installations of REAPER.
+- Automatically launches the native file chooser of the user’s desktop environment, providing better integration with bookmarks, theming, and UX consistency.
+- Can act as a sub-window of REAPER through proper parenting (note: on Wayland, this requires a handle that only the running REAPER executable itself could provide).
+- Supports a directory-only mode for selecting folders, similar to other OSes.
+- Supports multi-file selection.
+- Customizable dialog titles.
+- Separate open and save modes optimized for their respective workflows.
+- Accept button label can be customized (e.g., “Import” / “Export”).
+- Supports multiple file type filters - the selected filter is returned for use (e.g., to determine a save format).
+- Allows initial directory, file, or filename preselection.
+- Supports multiple checkboxes and drop-down lists in any desired order.
+
+## Known Limitations (Lua Demo)
+
+- Selecting a different file type in the save dialog only changes the file extension; the actual project type remains .RPP.
+REAPER’s ReaScript API currently does not provide a method to save in alternate formats.
+- The “Copy & Convert” option in the save dialog is only a visual placeholder for demonstration purposes. It has no effect in this version.
+- Some behaviors such as “Open in new tab” or making the just-saved project active are implemented using workarounds (e.g., reopening the project via an additional call).
+These hacks are necessary due to ReaScript API limitations - a native implementation inside REAPER would not require them and would behave exactly like the built-in file choosers.
+
+## Known Limitations (Portal File Choosers)
+
+- Only checkboxes and drop-down menus are currently supported as custom UI elements.
+Other widgets (buttons, text inputs, etc.) are not yet exposed through the portal API, even though the underlying toolkits would actually support this.
+- The GTK file chooser (in open mode) always shows an unused “Open read-only” checkbox.
+This is a quirk of the GTK portal backend - it appears for all portal calls, not just this script.
+KDE and GNOME backends do not have this issue. It cannot be disabled at present, but it does not affect functionality.
+- Remembering the last used folder or settings must be implemented by the host application (REAPER), which is probably consistent with its current behavior.
+
+## Development and Debugging Tips
+
+**Monitor live DBus responses**
+
+    dbus-monitor --session "type='method_return'"
+
+**Switching between KDE and GTK dialogs**
+
+If you use a KDE-based distribution (e.g., Kubuntu), both KDE and GTK portal backends are usually available.
+
+To force the GTK dialog, edit:
+
+    ~/.config/xdg-desktop-portal/portals.conf
+
+and set:
 
     [preferred]
     org.freedesktop.impl.portal.FileChooser=gtk
 
-This will switch to the GTK dialog after restarting the portal services with:
+Then restart the portal services:
 
     systemctl --user restart xdg-desktop-portal xdg-desktop-portal-gtk
 
-By commenting the lines in the config or by replacing "gtk" with "kde", the portal will switch back to the KDE file dialog .
+To revert, either comment out the entry or replace "gtk" with "kde".
 
-Shortcomings:
-- Choosing the file type in the save dialog will only set the file extension, but the file type will still be regular RPP. There seems to be no ReaScript API Endpoint for saving files in a different format.
-- Copy & Convert in the save project dialog is just an optical placeholder to demonstrate how it COULD look like. It doesn't actually do anything in this implementation.
-- Many features like "Open in new tab" or setting the current session to the saved project after the saving dialog is implemented with hacky solutions (like opening the project again with a second call). This is because of the limitations of the ReaScript API. Those features are still implemented because this project is meant to be a proof of concept and starting point for an official implementation of xdg-desktop-portals Filechooser. An offical implementation would of course not suffer from the same limitations and would behave exactly like it always did.
+**Testing the GNOME file chooser**
+
+GNOME uses its own variant of the portal file chooser, which differs from the generic GTK one.
+It also works seamlessly with portals.
+To test it, use a GNOME-based distribution such as Fedora Workstation.
